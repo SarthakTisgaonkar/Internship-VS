@@ -1,30 +1,24 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Play, Brain, Activity, RotateCcw, CheckCircle, 
-  MousePointer, Clock, FileText, ChevronRight, 
-  AlertCircle, ClipboardList, Grid, Zap, ShieldAlert,
-  Thermometer, Info, UserPlus, Users, User, History, Save, X, Database, Loader,
-  TrendingUp, TrendingDown, Minus, Calendar, BarChart3, Lightbulb, AlertTriangle,
-  Network, Sparkles, RefreshCw, XCircle, Gauge
+  Brain, Activity, CheckCircle, 
+  Clock, ChevronRight, 
+  AlertCircle, ClipboardList, Zap, ShieldAlert,
+  Info, UserPlus, Users, User, History, X, Loader,
+  TrendingUp, TrendingDown, Minus, Calendar, BarChart3, AlertTriangle,
+  XCircle, Database
 } from 'lucide-react';
+import {
+  initializeDatabase,
+  savePatientToDB,
+  getAllPatients,
+  getAssessmentsByPatientId,
+  saveAssessmentToDB,
+  getDatabaseStats,
+} from './database';
 
-/**
- * COGNITIVE ASSESSMENT PLATFORM v7.5
- * ------------------------------------------------------------
- * THEME: "Dark Purple" Split-Screen UI
- * FEATURES: 
- * - Physiological Filter (100ms)
- * - CoV & Throughput Metrics
- * - Penalized Scoring
- * - Self-Referenced Longitudinal Analysis
- * ------------------------------------------------------------
- */
-
-// --- Configuration ---
 const CONFIG = {
   PVT_DURATION_MS: 30000,
   PVT_LAPSE_THRESHOLD: 500,
-  PVT_FALSE_START_THRESHOLD: 100, // Physiological Limit
   MEM_GRID_SIZE: 9,
   MEM_START_LEVEL: 3,
   MEM_SHOW_TIME: 800,
@@ -57,10 +51,8 @@ interface AssessmentRecord {
   risk_level: string;
   rt_mean: number;   
   rt_sd: number;     
-  cov: number;        // Coefficient of Variation
   fatigue: number;   
   latency: number;   
-  throughput: number; // Memory Throughput
   lapses: number;    
   insight_text: string; 
 }
@@ -109,7 +101,7 @@ const QUESTION_BANK: QAQuestion[] = [
 
   // SAFETY
   { id: 301, category: 'Safety', text: "Safety incidents (stove on, unlocked doors)?", options: ["Never", "Rarely", "Occasionally", "Frequently"], correctIndex: 0, weight: 1.5 },
-  { id: 302, category: 'Safety', text: "Reaction to smell of smoke?", options: ["Evacuate/Call 911", "Investigate", "Panic/Freeze", "Ignore"], correctIndex: 0, weight: 1.4 },
+  { id: 302, category: 'Safety', text: "Reaction to smell of smoke?", options: ["Evacuate/Call 100", "Investigate", "Panic/Freeze", "Ignore"], correctIndex: 0, weight: 1.4 },
   { id: 303, category: 'Safety', text: "Wandering or getting lost outside?", options: ["Never", "Once", "Occasionally", "Frequently"], correctIndex: 0, weight: 1.8 },
   { id: 304, category: 'Safety', text: "Driving capability/accidents?", options: ["Safe/No Driving", "Minor Concerns", "Near misses", "Unsafe/Accidents"], correctIndex: 0, weight: 1.6 },
   { id: 305, category: 'Safety', text: "Handling of sharp objects/tools?", options: ["Safe", "Cautious", "Clumsy", "Dangerous"], correctIndex: 0, weight: 1.3 },
@@ -125,10 +117,10 @@ const QUESTION_BANK: QAQuestion[] = [
 ];
 
 // --- Math Utils ---
-const calcMean = (arr: number[]) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+const calcMean = (arr: number[]) => arr.length ? arr.reduce((a: number, b: number) => a + b, 0) / arr.length : 0;
 const calcSD = (arr: number[], mean: number) => {
   if (arr.length <= 1) return 0;
-  return Math.sqrt(arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b, 0) / (arr.length - 1)); 
+  return Math.sqrt(arr.map((x: number) => Math.pow(x - mean, 2)).reduce((a: number, b: number) => a + b, 0) / (arr.length - 1)); 
 };
 
 const generateClinicalID = () => {
@@ -157,14 +149,46 @@ const getScoreColor = (score: number) => {
   return 'text-rose-500';
 };
 
+interface SnackbarNotification {
+  id: string;
+  message: string;
+  type: 'success' | 'error' | 'warning' | 'info';
+  duration?: number;
+}
+
 export default function AssessmentPlatform() {
   const [currentScreen, setCurrentScreen] = useState<Screen>('HOME');
   const [dbReady, setDbReady] = useState(false);
+  const [snackbars, setSnackbars] = useState<SnackbarNotification[]>([]);
   
   // --- Data State ---
   const [patients, setPatients] = useState<Patient[]>([]);
   const [activePatient, setActivePatient] = useState<Patient | null>(null);
   const [patientHistory, setPatientHistory] = useState<AssessmentRecord[]>([]);
+
+  // ==========================
+  // 1. DATABASE INITIALIZATION
+  // ==========================
+  useEffect(() => {
+    const initDB = async () => {
+      try {
+        await initializeDatabase();
+        setDbReady(true);
+        showSnackbar('✅ Database initialized successfully', 'success', 3000);
+        console.log('Database ready');
+        
+        // Load initial patients
+        const loadedPatients = await getAllPatients();
+        setPatients(loadedPatients);
+      } catch (error) {
+        console.error('Database initialization error:', error);
+        setDbReady(false);
+        showSnackbar('❌ Database initialization error', 'error', 4000);
+      }
+    };
+    
+    initDB();
+  }, []);
   
   // --- Test States ---
   const [gameState, setGameState] = useState<GameState>('IDLE');
@@ -184,107 +208,85 @@ export default function AssessmentPlatform() {
   // --- ADAPTIVE QA STATES ---
   const [activeQuestions, setActiveQuestions] = useState<QAQuestion[]>([]); 
   const [answers, setAnswers] = useState<Record<number, number>>({}); 
-  const [qaTimeElapsed, setQaTimeElapsed] = useState(0);
 
   const timerRef = useRef<number | null>(null);
   const stimulusTimerRef = useRef<number | null>(null);
   const gameLoopRef = useRef<number | null>(null);
+  const assessmentSavedRef = useRef(false);
+
+  // --- SNACKBAR UTILITY FUNCTIONS ---
+  const showSnackbar = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info', duration: number = 4000) => {
+    const id = Date.now().toString();
+    const notification: SnackbarNotification = { id, message, type, duration };
+    setSnackbars((prev: SnackbarNotification[]) => [...prev, notification]);
+    
+    if (duration > 0) {
+      setTimeout(() => {
+        setSnackbars((prev: SnackbarNotification[]) => prev.filter((s: SnackbarNotification) => s.id !== id));
+      }, duration);
+    }
+  };
+
+  const closeSnackbar = (id: string) => {
+    setSnackbars((prev: SnackbarNotification[]) => prev.filter((s: SnackbarNotification) => s.id !== id));
+  };
 
   // ==========================
-  // 1. SQL INITIALIZATION
+  // 1. COMPONENT INITIALIZATION
   // ==========================
-  useEffect(() => {
-    const initDB = async () => {
-      try {
-        const loadSQL = () => {
-           return new Promise((resolve, reject) => {
-             if ((window as any).alasql) { resolve((window as any).alasql); return; }
-             const script = document.createElement('script');
-             script.src = "https://cdn.jsdelivr.net/npm/alasql@1.7.3/dist/alasql.min.js";
-             script.onload = () => resolve((window as any).alasql);
-             script.onerror = () => reject(new Error("Failed to load SQL engine"));
-             document.head.appendChild(script);
-           });
-        };
 
-        const alasql = await loadSQL();
-        
-        alasql('CREATE LOCALSTORAGE DATABASE IF NOT EXISTS neuro_local_v5');
-        alasql('ATTACH LOCALSTORAGE DATABASE neuro_local_v5');
-        alasql('USE neuro_local_v5');
+  // --- DATA MANAGEMENT (IndexedDB Backed) ---
 
-        alasql(`
-          CREATE TABLE IF NOT EXISTS patients (
-            id STRING PRIMARY KEY, 
-            name STRING, 
-            age INT, 
-            gender STRING, 
-            notes STRING, 
-            created_at NUMBER
-          )
-        `);
-
-        alasql(`
-          CREATE TABLE IF NOT EXISTS clinical_records (
-            id STRING PRIMARY KEY, 
-            patient_id STRING, 
-            date NUMBER, 
-            gcs NUMBER, 
-            api NUMBER, 
-            wmc NUMBER, 
-            risk_level STRING,
-            rt_mean NUMBER,
-            rt_sd NUMBER,
-            cov NUMBER,
-            fatigue NUMBER,
-            latency NUMBER,
-            throughput NUMBER,
-            lapses INT,
-            insight_text STRING
-          )
-        `);
-
-        alasql(`
-          CREATE TABLE IF NOT EXISTS question_logs (
-            patient_id STRING,
-            question_id INT,
-            category STRING,
-            score_normalized NUMBER, 
-            timestamp NUMBER
-          )
-        `);
-
-        setDbReady(true);
-        refreshPatients();
-      } catch (err) {
-        console.error("SQL Init Error:", err);
-      }
-    };
-    initDB();
-  }, []);
-
-  const refreshPatients = () => {
-    if (!(window as any).alasql) return;
-    const res = (window as any).alasql('SELECT * FROM patients ORDER BY created_at DESC');
-    setPatients(res);
+  const refreshPatients = async () => {
+    try {
+      const loadedPatients = await getAllPatients();
+      setPatients(loadedPatients);
+      console.log('Patients refreshed from database');
+    } catch (error) {
+      console.error('Error refreshing patients:', error);
+      showSnackbar('❌ Error loading patients', 'error', 3000);
+    }
   };
 
-  const refreshHistory = (patientId: string) => {
-    if (!(window as any).alasql) return;
-    const res = (window as any).alasql('SELECT * FROM clinical_records WHERE patient_id = ? ORDER BY date DESC', [patientId]);
-    setPatientHistory(res);
+  const refreshHistory = async (patientId: string) => {
+    try {
+      const history = await getAssessmentsByPatientId(patientId);
+      setPatientHistory(history);
+      console.log(`Assessment history loaded for patient ${patientId}`);
+    } catch (error) {
+      console.error('Error loading assessment history:', error);
+      showSnackbar('❌ Error loading assessment history', 'error', 3000);
+    }
   };
 
-  const sqlInsertPatient = (p: Patient) => {
-    (window as any).alasql('INSERT INTO patients VALUES (?,?,?,?,?,?)', 
-      [p.id, p.name, p.age, p.gender, p.notes, p.created_at]);
-    refreshPatients();
+  const savePatient = async (p: Patient) => {
+    try {
+      await savePatientToDB(p);
+      setPatients((prev: Patient[]) => {
+        const exists = prev.findIndex((pat: Patient) => pat.id === p.id);
+        if (exists >= 0) {
+          const updated = [...prev];
+          updated[exists] = p;
+          return updated;
+        }
+        return [p, ...prev];
+      });
+      showSnackbar(`✅ Patient "${p.name}" saved successfully`, 'success', 3000);
+    } catch (error) {
+      console.error('Error saving patient:', error);
+      showSnackbar('❌ Failed to save patient', 'error', 3000);
+    }
   };
 
-  const sqlInsertAssessment = (a: AssessmentRecord) => {
-    (window as any).alasql('INSERT INTO clinical_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', 
-      [a.id, a.patient_id, a.date, a.gcs, a.api, a.wmc, a.risk_level, a.rt_mean, a.rt_sd, a.cov, a.fatigue, a.latency, a.throughput, a.lapses, a.insight_text]);
-    refreshHistory(a.patient_id);
+  const saveAssessment = async (a: AssessmentRecord) => {
+    try {
+      await saveAssessmentToDB(a);
+      setPatientHistory((prev: AssessmentRecord[]) => [a, ...prev]);
+      showSnackbar(`✅ Assessment record saved (GCS: ${a.gcs?.toFixed(0)})`, 'success', 3000);
+    } catch (error) {
+      console.error('Error saving assessment:', error);
+      showSnackbar('❌ Failed to save assessment', 'error', 3000);
+    }
   };
 
   // ==========================
@@ -292,118 +294,63 @@ export default function AssessmentPlatform() {
   // ==========================
 
   const generateAdaptiveQuestions = (patientId: string): QAQuestion[] => {
-    const logs = (window as any).alasql('SELECT * FROM question_logs WHERE patient_id = ? ORDER BY timestamp DESC', [patientId]);
-    const weights: Record<string, number> = { Safety: 1, Memory: 1, Executive: 1, Mood: 1 };
-    const recentQIds = new Set<number>();
-    const recentLogs = logs.slice(0, 50);
-    
-    recentLogs.forEach((log: any) => {
-      recentQIds.add(log.question_id);
-      if (log.score_normalized < 0.5) {
-        weights[log.category] += 0.5; 
-      } else {
-        weights[log.category] = Math.max(0.5, weights[log.category] - 0.1);
-      }
-    });
-
+    // Generate random questions without database queries
     const selected: QAQuestion[] = [];
-    const available = QUESTION_BANK.filter(q => !recentQIds.has(q.id)); 
-    const pool = available.length < CONFIG.QA_QUESTIONS_PER_SESSION ? QUESTION_BANK : available;
-    const byCategory: Record<string, QAQuestion[]> = { Safety: [], Memory: [], Executive: [], Mood: [] };
-    pool.forEach(q => byCategory[q.category]?.push(q));
-
-    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
-    const categories = ['Safety', 'Memory', 'Executive', 'Mood'];
+    const usedIds = new Set<number>();
     
-    categories.forEach(cat => {
-      if (byCategory[cat].length > 0) {
-        const randomIndex = Math.floor(Math.random() * byCategory[cat].length);
-        selected.push(byCategory[cat].splice(randomIndex, 1)[0]);
-      }
-    });
-
-    while (selected.length < CONFIG.QA_QUESTIONS_PER_SESSION) {
-      let r = Math.random() * totalWeight;
-      let selectedCat = categories[categories.length - 1];
-      for (const cat of categories) {
-        r -= weights[cat];
-        if (r <= 0) {
-          selectedCat = cat;
-          break;
-        }
-      }
-      if (byCategory[selectedCat].length > 0) {
-        const idx = Math.floor(Math.random() * byCategory[selectedCat].length);
-        selected.push(byCategory[selectedCat].splice(idx, 1)[0]);
-      } else {
-        const remainingCats = categories.filter(c => byCategory[c].length > 0);
-        if (remainingCats.length === 0) break; 
-        const backupCat = remainingCats[Math.floor(Math.random() * remainingCats.length)];
-        const idx = Math.floor(Math.random() * byCategory[backupCat].length);
-        selected.push(byCategory[backupCat].splice(idx, 1)[0]);
+    while (selected.length < CONFIG.QA_QUESTIONS_PER_SESSION && usedIds.size < QUESTION_BANK.length) {
+      const randomIndex = Math.floor(Math.random() * QUESTION_BANK.length);
+      if (!usedIds.has(QUESTION_BANK[randomIndex].id)) {
+        selected.push(QUESTION_BANK[randomIndex]);
+        usedIds.add(QUESTION_BANK[randomIndex].id);
       }
     }
-    return selected;
+    
+    return selected.length > 0 ? selected : QUESTION_BANK.slice(0, CONFIG.QA_QUESTIONS_PER_SESSION);
   };
 
   // ==========================
-  // 3. LOGIC & SCORING (CLINICAL UPGRADE)
+  // 3. LOGIC & SCORING (ROBUST)
   // ==========================
   
   const runAnalysis = () => {
     let insights: string[] = [];
-    let alerts: string[] = [];
+    let alerts: string[] = []; // Specific warnings about valid/invalid tests
 
     // --- 1. PVT ANALYSIS ---
-    const validReactions = reactions.filter(r => !r.isFalseStart);
+    const validReactions = reactions.filter((r: any) => !r.isFalseStart);
     let pvtValid = true;
     let meanRT = 0, sdRT = 0, lapses = 0, fatigueIndex = 0;
-    let speedScore = 0;
-    let cov = 0; // Coefficient of Variation
     
+    // Check PVT Validity
     if (validReactions.length < CONFIG.MIN_PVT_RESPONSES) {
        pvtValid = false;
-       alerts.push("ATTENTION TEST INVALID (Insufficient Data)");
-       insights.push("Reflexes data discarded.");
+       alerts.push("ATTENTION TEST INVALID (Insufficient Responses)");
+       insights.push("Reflexes task data discarded due to lack of participation.");
     } else {
-       const rtValues = validReactions.map(r => r.reactionTime);
+       const rtValues = validReactions.map((r: any) => r.reactionTime);
        meanRT = calcMean(rtValues);
        sdRT = calcSD(rtValues, meanRT);
-       lapses = reactions.filter(r => r.isLapse).length;
-       
-       // New Metric: Coefficient of Variation (CoV)
-       cov = meanRT > 0 ? (sdRT / meanRT) * 100 : 0;
-
-       // New Metric: Response Speed (1/RT)
-       // We normalize this to a score roughly 0-100 for internal consistency
-       // Avg healthy is 250ms -> 4.0. We multiply by 25 to get ~100 base.
-       speedScore = meanRT > 0 ? (1000 / meanRT) * 25 : 0; 
-
+       lapses = reactions.filter((r: any) => r.isLapse).length;
        const midpoint = Math.floor(validReactions.length / 2);
-       const firstHalf = validReactions.slice(0, midpoint).map(r => r.reactionTime);
-       const secondHalf = validReactions.slice(midpoint).map(r => r.reactionTime);
+       const firstHalf = validReactions.slice(0, midpoint).map((r: any) => r.reactionTime);
+       const secondHalf = validReactions.slice(midpoint).map((r: any) => r.reactionTime);
        fatigueIndex = secondHalf.length > 0 ? calcMean(secondHalf) - calcMean(firstHalf) : 0;
     }
 
     // --- 2. MEMORY ANALYSIS ---
     let memValid = memoryRounds.length > 0;
     let maxSpan = 0, avgRecallLatency = 0;
-    let throughput = 0;
-
     if (!memValid) {
        alerts.push("MEMORY TEST SKIPPED");
+       insights.push("Memory span data unavailable.");
     } else {
-       maxSpan = memoryRounds.filter(r => r.success).reduce((max, r) => Math.max(max, r.sequenceLength), 0);
-       avgRecallLatency = calcMean(memoryRounds.map(r => r.avgClickLatency));
-       
-       // New Metric: Throughput (Efficiency)
-       // Items per minute derived score
-       // (Span / LatencySeconds)
-       const latSec = avgRecallLatency / 1000;
-       throughput = latSec > 0 ? (maxSpan / latSec) : 0;
+       maxSpan = memoryRounds.filter((r: any) => r.success).reduce((max: number, r: any) => Math.max(max, r.sequenceLength), 0);
+       avgRecallLatency = calcMean(memoryRounds.map((r: any) => r.avgClickLatency));
     }
 
     // --- 3. QA ANALYSIS ---
+    // If no active questions, this part is 0
     let qaValid = activeQuestions.length > 0 && Object.keys(answers).length > 0;
     let functionalIndex = 0;
     const categoryScores: Record<string, number> = { Safety: 0, Memory: 0, Executive: 0, Mood: 0 };
@@ -413,7 +360,7 @@ export default function AssessmentPlatform() {
     } else {
        let totalScore = 0;
        let maxPossibleScore = 0;
-       activeQuestions.forEach(q => {
+       activeQuestions.forEach((q: QAQuestion) => {
          const score = (q.options.length - 1 - (answers[q.id] || 0)) / (q.options.length - 1); 
          const weightedScore = score * q.weight;
          totalScore += weightedScore;
@@ -425,54 +372,52 @@ export default function AssessmentPlatform() {
 
     // --- SCORING MODELS ---
     
-    // API (Attention): 
-    // Uses Speed Score (1/RT based) + Stability (CoV based) + Vigilance (Lapses)
+    // API (Attention): Force 0 if invalid
+    // Using Reciprocal Transform (1000/MeanRT) for better accuracy
     let api = 0;
+    let cov = 0; // Coefficient of Variation
     if (pvtValid) {
-        // Speed: 100 is ~250ms. 
-        const sScore = Math.min(100, speedScore);
-        
-        // Stability: CoV < 15% is good (100). CoV > 30% is bad (0).
-        const stabilityScore = Math.max(0, 100 - ((cov - 15) * 6)); 
-        
-        // Vigilance: Penalize errors
-        const vigilanceScore = Math.max(0, 100 - (lapses * 15) - (falseStarts * 5));
-        
-        api = (sScore * 0.4) + (stabilityScore * 0.3) + (vigilanceScore * 0.3);
+        // Reciprocal Transform: 1000/MeanRT (better accuracy than linear)
+        const speedScore = Math.max(0, Math.min(100, (1000 / meanRT) * 25));
+        // CoV: (SD / Mean) * 100 for instability measure
+        cov = (sdRT / meanRT) * 100;
+        const stabilityScore = Math.max(0, 100 - (cov * 2)); // Scale CoV to score
+        const vigilanceScore = Math.max(0, 100 - (lapses * 10) - (falseStarts * 5));
+        api = (speedScore * 0.4) + (stabilityScore * 0.3) + (vigilanceScore * 0.3);
     }
 
-    // WMC (Memory): 
-    // Uses Span + Efficiency (Throughput)
+    // WMC (Memory): Force 0 if invalid
     let wmc = 0;
-    if (memValid && maxSpan > 0) {
+    let throughput = 0; // Memory Throughput: items/second
+    if (memValid) {
         const spanScore = (maxSpan / 9) * 100;
-        
-        // Efficiency: 2.0 items/sec is great. 0.5 is poor.
-        const effScore = Math.min(100, throughput * 40); 
-        
+        // Convert latency from ms to seconds
+        const latencySec = avgRecallLatency / 1000;
+        // Throughput: Span / LatencySeconds (items/second)
+        throughput = latencySec > 0 ? maxSpan / latencySec : 0;
+        const effScore = Math.max(0, Math.min(100, (throughput / 3) * 100)); // 3 items/sec = 100
         wmc = (spanScore * 0.6) + (effScore * 0.4);
     }
 
-    // GCS (Global): Penalized
+    // GCS (Global): Weighted average of AVAILABLE scores
+    // If a section is invalid, it contributes 0 to the score (Penalized Scoring)
+    // This is "majorly affecting the score" as requested by user - a missed test drops the average significantly.
     const gcs = (api * 0.3) + (wmc * 0.3) + (functionalIndex * 0.4);
 
-    // --- INSIGHT TEXT GENERATION ---
+    // --- GENERATE INSIGHT TEXT ---
     if (pvtValid) {
-        if (falseStarts > 2) insights.push("High impulsivity.");
-        if (cov > 20) insights.push("Significant cognitive instability.");
-        if (fatigueIndex > 50) insights.push("Rapid mental fatigue.");
+        if (falseStarts > 2) insights.push("Impulsivity detected.");
+        if (sdRT > 150) insights.push("High reaction variability.");
+        if (fatigueIndex > 50) insights.push("Performance decrement over time.");
     }
-    if (memValid) {
-        if (throughput < 1.0 && maxSpan > 4) insights.push("Accurate but slow processing.");
-        if (maxSpan < 4) insights.push("Low working memory capacity.");
-    }
+    if (memValid && maxSpan < 4) insights.push("Working memory below average.");
     
-    const insightText = insights.length > 0 ? insights.join(" ") : "Cognitive functions within normal limits.";
+    const insightText = insights.length > 0 ? insights.join(" ") : "Performance within parameters.";
 
     return {
-      raw: { meanRT, sdRT, cov, lapses, fatigueIndex, maxSpan, avgRecallLatency, throughput },
+      raw: { meanRT, sdRT, lapses, fatigueIndex, maxSpan, avgRecallLatency },
       qa: { functionalIndex, categoryScores },
-      models: { api, wmc, gcs },
+      models: { api, wmc, gcs, cov, throughput },
       status: { pvtValid, memValid, qaValid },
       text: insightText,
       alerts: alerts
@@ -481,53 +426,263 @@ export default function AssessmentPlatform() {
 
   const results = runAnalysis();
 
-  // Auto-Save Effect
+  // Auto-Save Effect - Saves assessment when results screen is shown (only once)
   useEffect(() => {
-    if (currentScreen === 'RESULTS' && activePatient && dbReady) {
+    if (currentScreen === 'RESULTS' && activePatient && dbReady && !assessmentSavedRef.current) {
+       // Only save if there's actual test data
+       if (reactions.length === 0 && memoryRounds.length === 0 && Object.keys(answers).length === 0) {
+          return;
+       }
+       
+       assessmentSavedRef.current = true;
+       
        let riskLevel = "Low Risk";
        if (results.models.gcs < 70) riskLevel = "Moderate";
        if (results.models.gcs < 50) riskLevel = "High";
        
-       const lastRecord = patientHistory[0];
-       const isRecent = lastRecord && (Date.now() - lastRecord.date < 5000);
-       
-       if (!isRecent) {
-          const record: AssessmentRecord = {
-             id: Date.now().toString(),
-             patient_id: activePatient.id,
-             date: Date.now(),
-             gcs: results.models.gcs,
-             api: results.models.api,
-             wmc: results.models.wmc,
-             risk_level: riskLevel,
-             rt_mean: results.raw.meanRT,
-             rt_sd: results.raw.sdRT,
-             cov: results.raw.cov,
-             fatigue: results.raw.fatigueIndex,
-             latency: results.raw.avgRecallLatency,
-             throughput: results.raw.throughput,
-             lapses: results.raw.lapses,
-             insight_text: results.text
-          };
-          sqlInsertAssessment(record);
-       }
+       const record: AssessmentRecord = {
+          id: Date.now().toString(),
+          patient_id: activePatient.id,
+          date: Date.now(),
+          gcs: results.models.gcs,
+          api: results.models.api,
+          wmc: results.models.wmc,
+          risk_level: riskLevel,
+          rt_mean: results.raw.meanRT,
+          rt_sd: results.raw.sdRT,
+          cov: results.models.cov,
+          fatigue: results.raw.fatigueIndex,
+          latency: results.raw.avgRecallLatency,
+          throughput: results.models.throughput,
+          lapses: results.raw.lapses,
+          insight_text: results.text
+       };
+       saveAssessment(record);
     }
   }, [currentScreen]); 
+
+  // ==========================
+  // 4. UI HANDLERS & COMPONENTS
+  // ==========================
+
+  const registerPatient = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const form = e.target as HTMLFormElement;
+    const formData = new FormData(form);
+    
+    const newPatient: Patient = {
+      id: generateClinicalID(),
+      name: formData.get('name') as string,
+      age: parseInt(formData.get('age') as string),
+      gender: formData.get('gender') as string,
+      notes: formData.get('notes') as string,
+      created_at: Date.now()
+    };
+
+    await savePatient(newPatient);
+    setActivePatient(newPatient);
+    setPatientHistory([]);
+    setCurrentScreen('DISCLAIMER');
+  };
+
+  const selectPatient = async (patient: Patient) => {
+    setActivePatient(patient);
+    await refreshHistory(patient.id);
+    setCurrentScreen('HOME');
+  };
+
+  const abortAssessment = () => {
+    if (gameLoopRef.current) clearInterval(gameLoopRef.current);
+    if (stimulusTimerRef.current) clearTimeout(stimulusTimerRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    setGameState('IDLE');
+    setMemoryState('IDLE');
+    setReactions([]);
+    setMemoryRounds([]);
+    setAnswers({});
+    setFalseStarts(0);
+    setMemoryLevel(CONFIG.MEM_START_LEVEL);
+    setActiveQuestions([]);
+    assessmentSavedRef.current = false;
+    setCurrentScreen('HOME');
+  };
+
+  const handleStartRequest = () => { 
+    assessmentSavedRef.current = false;
+    activePatient ? setCurrentScreen('DISCLAIMER') : setCurrentScreen('PATIENT_INTAKE'); 
+  };
+  
+  // Game Logic
+  const startPVT = () => {
+    setReactions([]);
+    setFalseStarts(0);
+    setGameTimeLeft(CONFIG.PVT_DURATION_MS);
+    setCurrentScreen('GAME');
+    setGameState('WAITING');
+    gameLoopRef.current = window.setInterval(() => {
+      setGameTimeLeft((prev: number) => {
+        if (prev <= 100) {
+          endPVT();
+          return 0;
+        }
+        return prev - 100;
+      });
+    }, 100);
+    scheduleStimulus();
+  };
+  
+  const scheduleStimulus = () => {
+    const delay = Math.random() * (3000 - 1000) + 1000;
+    stimulusTimerRef.current = window.setTimeout(() => {
+      setGameState('STIMULUS');
+      setStimulusStartTime(performance.now());
+    }, delay);
+  };
+  
+  const handlePVTClick = () => {
+    if (gameState === 'WAITING') {
+      setFalseStarts((prev: number) => prev + 1);
+      if (stimulusTimerRef.current) clearTimeout(stimulusTimerRef.current);
+      scheduleStimulus();
+    } else if (gameState === 'STIMULUS') {
+      const endTime = performance.now();
+      const reactionTime = endTime - stimulusStartTime;
+      // PHYSIOLOGICAL FILTER: Reject clicks <100ms as False Starts
+      const isFalseStart = reactionTime < 100;
+      if (isFalseStart) {
+        setFalseStarts((prev: number) => prev + 1);
+      } else {
+        setReactions((prev: any[]) => [...prev, {
+          timestamp: Date.now(),
+          reactionTime,
+          isFalseStart: false,
+          isLapse: reactionTime > CONFIG.PVT_LAPSE_THRESHOLD
+        }]);
+      }
+      setGameState('WAITING');
+      scheduleStimulus();
+    }
+  };
+  
+  const endPVT = () => {
+    if (gameLoopRef.current) clearInterval(gameLoopRef.current);
+    if (stimulusTimerRef.current) clearTimeout(stimulusTimerRef.current);
+    setGameState('FINISHED');
+    setTimeout(() => setCurrentScreen('MEMORY_INTRO'), 1500);
+  };
+  
+  const startMemoryGame = () => {
+    setMemoryLevel(CONFIG.MEM_START_LEVEL);
+    setMemoryRounds([]);
+    setCurrentScreen('MEMORY');
+    startMemoryRound(CONFIG.MEM_START_LEVEL);
+  };
+  
+  const startMemoryRound = (level: number) => {
+    setMemoryState('SHOWING');
+    setUserSequence([]);
+    setShowingIdx(null);
+    const newSeq = Array.from({ length: level }, () => Math.floor(Math.random() * CONFIG.MEM_GRID_SIZE));
+    setSequence(newSeq);
+    let i = 0;
+    const interval = setInterval(() => {
+      setShowingIdx(newSeq[i]);
+      setTimeout(() => setShowingIdx(null), CONFIG.MEM_SHOW_TIME - 200);
+      i++;
+      if (i >= newSeq.length) {
+        clearInterval(interval);
+        setTimeout(() => {
+          setMemoryState('USER_TURN');
+          setLastClickTime(Date.now());
+        }, CONFIG.MEM_INTER_STIM_TIME);
+      }
+    }, CONFIG.MEM_SHOW_TIME);
+  };
+  
+  const handleMemoryClick = (index: number) => {
+    if (memoryState !== 'USER_TURN') return;
+    const now = Date.now();
+    const latency = now - lastClickTime;
+    setLastClickTime(now);
+    const newUserSeq = [...userSequence, index];
+    setUserSequence(newUserSeq);
+    const checkIdx = newUserSeq.length - 1;
+    
+    if (newUserSeq[checkIdx] !== sequence[checkIdx]) {
+      setMemoryRounds((prev: any[]) => [...prev, {
+        level: memoryLevel,
+        success: false,
+        sequenceLength: sequence.length,
+        avgClickLatency: latency
+      }]);
+      setMemoryState('FAILURE');
+      setTimeout(() => setCurrentScreen('QA_INTRO'), 1500);
+    } else {
+      if (newUserSeq.length === sequence.length) {
+        setMemoryRounds((prev: any[]) => [...prev, {
+          level: memoryLevel,
+          success: true,
+          sequenceLength: sequence.length,
+          avgClickLatency: latency
+        }]);
+        setMemoryState('SUCCESS');
+        const nextLevel = memoryLevel + 1;
+        if (nextLevel > 7) {
+          setTimeout(() => setCurrentScreen('QA_INTRO'), 1500);
+        } else {
+          setMemoryLevel(nextLevel);
+          setTimeout(() => startMemoryRound(nextLevel), 1500);
+        }
+      }
+    }
+  };
+  
+  const startQA = () => { 
+    if (!activePatient) return;
+    setCurrentScreen('QA_LOADING');
+    setTimeout(() => {
+      const questions = generateAdaptiveQuestions(activePatient.id);
+      setActiveQuestions(questions);
+      setCurrentScreen('QA');
+    }, 1500);
+  };
+  
+  const handleAnswer = (qId: number, optionIndex: number) => {
+    setAnswers((prev: any) => ({ ...prev, [qId]: optionIndex }));
+  };
+  
+  const submitQA = () => { 
+    if (timerRef.current) clearInterval(timerRef.current); 
+    setCurrentScreen('RESULTS'); 
+  };
+
+  const ExitButton = ({ dark = false }) => (
+    <button 
+      onClick={(e: any) => { 
+        e.stopPropagation(); 
+        abortAssessment(); 
+      }} 
+      className={`absolute top-6 right-6 p-2 rounded-full transition-all z-50 ${dark ? 'bg-white/10 hover:bg-white/20 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`} 
+      title="Abort Assessment"
+    >
+      <X className="w-5 h-5" />
+    </button>
+  );
 
   // ==========================
   // 5. RENDERING
   // ==========================
 
+  // --- HOME SCREEN ---
   if (!dbReady) {
     return (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center text-white flex-col gap-4">
         <Loader className="w-10 h-10 animate-spin text-indigo-500" />
-        <p>Initializing Neuro Adaptive Engine...</p>
+        <p>Initializing Device Database...</p>
       </div>
     );
   }
 
-  // --- HOME SCREEN ---
   if (currentScreen === 'HOME') {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 font-sans">
@@ -567,7 +722,8 @@ export default function AssessmentPlatform() {
               )}
             </div>
             <div className="absolute bottom-6 left-12 flex items-center gap-2 text-[10px] font-medium text-slate-600 uppercase tracking-widest">
-               <Database className="w-3 h-3" /> Secure Local Storage
+               <Database className="w-3 h-3" /> On-Device Storage
+               <span className="ml-2 text-emerald-500 font-bold">({patients.length})</span>
             </div>
           </div>
           <div className="p-12 flex flex-col justify-center bg-white relative">
@@ -595,18 +751,277 @@ export default function AssessmentPlatform() {
   }
 
   // --- STANDARD SCREENS ---
-  if (currentScreen === 'PATIENT_INTAKE') return <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4"><div className="max-w-xl w-full bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100"><div className="bg-indigo-700 p-8 text-white"><h2 className="text-2xl font-bold flex items-center gap-3"><UserPlus className="text-indigo-200"/> New Registration</h2></div><form onSubmit={registerPatient} className="p-8 space-y-6"><div className="space-y-4"><div><label className="block text-sm font-bold text-slate-700 mb-2">Full Name</label><input required name="name" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g. John Doe"/></div><div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold text-slate-700 mb-2">Age</label><input required name="age" type="number" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none"/></div><div><label className="block text-sm font-bold text-slate-700 mb-2">Gender</label><select name="gender" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none"><option>Male</option><option>Female</option><option>Other</option></select></div></div><div><label className="block text-sm font-bold text-slate-700 mb-2">Notes</label><textarea name="notes" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none h-24"/></div></div><div className="flex gap-4"><button type="button" onClick={()=>setCurrentScreen('HOME')} className="flex-1 py-4 font-bold text-slate-500 hover:bg-slate-50 rounded-xl">Cancel</button><button type="submit" className="flex-1 py-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 shadow-lg">Create Profile</button></div></form></div></div>;
-  if (currentScreen === 'PATIENT_SELECT') return <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4"><div className="max-w-2xl w-full bg-white rounded-3xl shadow-xl overflow-hidden flex flex-col max-h-[80vh] border border-slate-100"><div className="bg-indigo-700 p-6 text-white flex justify-between items-center"><h2 className="text-xl font-bold flex gap-3"><Users/> Patient Database</h2><button onClick={()=>setCurrentScreen('HOME')} className="hover:bg-indigo-600 p-2 rounded-lg transition"><X/></button></div><div className="p-4 overflow-y-auto flex-grow space-y-2">{patients.map(p=><div key={p.id} onClick={()=>selectPatient(p)} className="flex items-center justify-between p-4 hover:bg-indigo-50 rounded-xl cursor-pointer border border-transparent hover:border-indigo-100 transition"><div className="flex items-center gap-4"><div className="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center font-bold">{p.name[0]}</div><div><div className="font-bold text-slate-800">{p.name}</div><div className="text-xs text-slate-500">{p.id} • {p.age} y/o</div></div></div><ChevronRight className="text-slate-300"/></div>)}</div></div></div>;
-  if (currentScreen === 'DISCLAIMER') return <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4"><div className="max-w-lg w-full bg-white rounded-3xl p-8 space-y-6 relative"><ExitButton/><h2 className="text-2xl font-bold text-rose-600 flex gap-2"><ShieldAlert/> Medical Disclaimer</h2><p className="text-slate-600 leading-relaxed">This tool measures reaction latency and working memory span. It generates statistical insights for research purposes only. <strong>It does not provide a medical diagnosis.</strong></p><button onClick={()=>setCurrentScreen('GAME_INTRO')} className="w-full py-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700">I Acknowledge & Continue</button></div></div>;
+  if (currentScreen === 'PATIENT_INTAKE') return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+      <div className="max-w-xl w-full bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100">
+        <div className="bg-indigo-700 p-8 text-white">
+          <h2 className="text-2xl font-bold flex items-center gap-3">
+            <UserPlus className="text-indigo-200"/> New Registration
+          </h2>
+        </div>
+        <form onSubmit={registerPatient} className="p-8 space-y-6">
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-2">Full Name</label>
+              <input required name="name" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g. Rahul Sharma"/>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-bold text-slate-700 mb-2">Age</label>
+                <input required name="age" type="number" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none"/>
+              </div>
+              <div>
+                <label className="block text-sm font-bold text-slate-700 mb-2">Gender</label>
+                <select name="gender" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none">
+                  <option>Male</option>
+                  <option>Female</option>
+                  <option>Other</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-2">Notes</label>
+              <textarea name="notes" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none h-24"/>
+            </div>
+          </div>
+          <div className="flex gap-4">
+            <button type="button" onClick={() => setCurrentScreen('HOME')} className="flex-1 py-4 font-bold text-slate-500 hover:bg-slate-50 rounded-xl">
+              Cancel
+            </button>
+            <button type="submit" className="flex-1 py-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 shadow-lg">
+              Create Profile
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+  
+  if (currentScreen === 'PATIENT_SELECT') return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+      <div className="max-w-2xl w-full bg-white rounded-3xl shadow-xl overflow-hidden flex flex-col max-h-[80vh] border border-slate-100">
+        <div className="bg-indigo-700 p-6 text-white flex justify-between items-center">
+          <h2 className="text-xl font-bold flex gap-3">
+            <Users /> Patient Database
+          </h2>
+          <button onClick={() => setCurrentScreen('HOME')} className="hover:bg-indigo-600 p-2 rounded-lg transition">
+            <X />
+          </button>
+        </div>
+        <div className="p-4 overflow-y-auto flex-grow space-y-2">
+          {patients && patients.length > 0 ? (
+            patients.map((p: Patient) => (
+              <div 
+                key={p.id} 
+                onClick={() => selectPatient(p)} 
+                className="flex items-center justify-between p-4 hover:bg-indigo-50 rounded-xl cursor-pointer border border-transparent hover:border-indigo-100 transition"
+              >
+                <div className="flex items-center gap-4">
+                  <div className="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center font-bold">
+                    {p.name && p.name.length > 0 ? p.name[0].toUpperCase() : '?'}
+                  </div>
+                  <div>
+                    <div className="font-bold text-slate-800">{p.name || 'Unnamed'}</div>
+                    <div className="text-xs text-slate-500">{p.id} • {p.age || 'N/A'} y/o</div>
+                  </div>
+                </div>
+                <ChevronRight className="text-slate-300" />
+              </div>
+            ))
+          ) : (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-400">
+              <Users className="w-12 h-12 mb-3 opacity-30" />
+              <p className="text-sm">No patients found</p>
+              <p className="text-xs opacity-70 mt-1">Create a new patient to get started</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+  
+  if (currentScreen === 'DISCLAIMER') return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+      <div className="max-w-lg w-full bg-white rounded-3xl p-8 space-y-6 relative">
+        <ExitButton/>
+        <h2 className="text-2xl font-bold text-rose-600 flex gap-2">
+          <ShieldAlert/> Medical Disclaimer
+        </h2>
+        <p className="text-slate-600 leading-relaxed">
+          This tool measures reaction latency and working memory span. It generates statistical insights for research purposes only. <strong>It does not provide a medical diagnosis.</strong>
+        </p>
+        <button onClick={() => setCurrentScreen('GAME_INTRO')} className="w-full py-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700">
+          I Acknowledge & Continue
+        </button>
+      </div>
+    </div>
+  );
 
   // --- GAME UIs ---
-  if (currentScreen === 'GAME_INTRO') return <div className="min-h-screen bg-slate-900 flex items-center justify-center relative"><ExitButton dark/><div className="text-center text-white"><h2 className="text-4xl font-bold mb-8">Task 1: Red-Green</h2><div className="space-y-2 mb-8 text-slate-300"><p>Tap screen immediately when it turns GREEN.</p><p>Do NOT tap on RED.</p></div><button onClick={startPVT} className="bg-emerald-500 hover:bg-emerald-600 text-white py-5 px-12 rounded-2xl font-bold text-xl shadow-lg transition-all transform hover:-translate-y-1">BEGIN TASK</button></div></div>;
-  if (currentScreen === 'GAME') return <div onMouseDown={handlePVTClick} className={`min-h-screen cursor-pointer flex flex-col items-center justify-center transition-colors duration-100 select-none ${gameState === 'WAITING' ? 'bg-rose-500' : gameState === 'STIMULUS' ? 'bg-emerald-500' : 'bg-slate-900'}`}><ExitButton dark />{gameState === 'FINISHED' ? (<div className="text-white text-4xl font-bold animate-pulse">Test Complete</div>) : (<><div className="text-white/80 font-mono text-4xl font-bold mb-8">{gameState === 'WAITING' ? 'WAIT...' : gameState === 'STIMULUS' ? 'CLICK!' : ''}</div><div className="absolute bottom-10 flex gap-8 text-white/60 font-mono text-lg"><div>{(gameTimeLeft/1000).toFixed(1)}s</div><div>Hits: {reactions.filter(r=>!r.isFalseStart).length}</div><div>Errors: {falseStarts}</div></div></>)}</div>;
-  if (currentScreen === 'MEMORY_INTRO') return <div className="min-h-screen bg-slate-900 flex items-center justify-center relative"><ExitButton dark/><div className="text-center text-white"><h2 className="text-4xl font-bold mb-8">Task 2: Memory</h2><div className="space-y-2 mb-8 text-slate-300"><p>Watch the grid squares light up.</p><p>Repeat the sequence exactly.</p></div><button onClick={startMemoryGame} className="bg-blue-500 hover:bg-blue-600 text-white py-5 px-12 rounded-2xl font-bold text-xl shadow-lg transition-all transform hover:-translate-y-1">BEGIN TASK</button></div></div>;
-  if (currentScreen === 'MEMORY') return <div className="min-h-screen bg-slate-800 flex flex-col items-center justify-center p-4 relative"><ExitButton dark /><h2 className="text-white text-2xl font-bold mb-8">{memoryState === 'SHOWING' ? 'Watch Sequence...' : memoryState === 'USER_TURN' ? 'Your Turn' : memoryState === 'SUCCESS' ? 'Correct!' : 'Incorrect'}</h2><div className="grid grid-cols-3 gap-4 mb-8">{Array.from({ length: 9 }).map((_, i) => (<div key={i} onMouseDown={() => handleMemoryClick(i)} className={`w-24 h-24 rounded-xl transition-all duration-200 border-4 ${showingIdx === i ? 'bg-blue-400 border-blue-200 shadow-[0_0_20px_rgba(96,165,250,0.5)] transform scale-105' : 'bg-slate-700 border-slate-600 hover:border-slate-500'} ${memoryState === 'USER_TURN' ? 'cursor-pointer active:bg-blue-500' : 'cursor-default'}`}/>))}</div><div className="text-slate-400 font-mono text-lg">Level: {memoryLevel - 2}</div></div>;
-  if (currentScreen === 'QA_INTRO') return <div className="min-h-screen bg-slate-50 flex items-center justify-center relative"><ExitButton/><div className="max-w-md w-full text-center space-y-6"><Activity className="w-16 h-16 mx-auto text-purple-600"/><h2 className="text-3xl font-bold text-slate-800">Response Based Test</h2><p className="text-slate-600">Final section: Clinical questions regarding daily behavior.</p><button onClick={startQA} className="w-full bg-purple-600 hover:bg-purple-700 text-white py-4 rounded-xl font-bold text-xl transition-all shadow-lg">Start Questionnaire</button></div></div>;
-  if (currentScreen === 'QA_LOADING') return <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center relative"><ExitButton/><div className="max-w-md w-full text-center space-y-8 p-8"><div className="relative w-24 h-24 mx-auto"><div className="absolute inset-0 border-4 border-slate-100 rounded-full"></div><div className="absolute inset-0 border-4 border-purple-600 rounded-full border-t-transparent animate-spin"></div><Brain className="absolute inset-0 m-auto text-purple-600 w-10 h-10" /></div><div><h3 className="text-xl font-bold text-slate-800 mb-2">Analyzing History...</h3><p className="text-slate-500">The Neural Engine is generating a dynamic question set based on previous performance patterns.</p></div><div className="flex justify-center gap-2"><span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0s'}}></span><span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></span><span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span></div></div></div>;
-  if (currentScreen === 'QA') return <div className="min-h-screen bg-slate-50 flex flex-col relative"><ExitButton/><div className="max-w-3xl mx-auto w-full p-6 space-y-6 mt-10 pb-20">{activeQuestions.map((q,idx)=><div key={q.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100"><div className="flex justify-between items-start mb-4"><h3 className="font-bold text-lg text-slate-800 flex gap-3"><span className="bg-purple-100 text-purple-600 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold">{idx+1}</span> {q.text}</h3><span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider border border-slate-100 px-2 py-1 rounded-lg">{q.category}</span></div><div className="grid gap-2 pl-11">{q.options.map((o,i)=><button key={i} onClick={()=>handleAnswer(q.id,i)} className={`w-full text-left p-4 rounded-xl border-2 transition-all ${answers[q.id]===i?'bg-purple-50 border-purple-500 text-purple-900 font-medium':'bg-white border-slate-100 hover:border-slate-300 text-slate-600'}`}>{o}</button>)}</div></div>)}<button onClick={submitQA} disabled={Object.keys(answers).length!==activeQuestions.length} className="w-full bg-slate-900 text-white py-5 rounded-2xl font-bold text-xl hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition shadow-xl">Generate Clinical Report</button></div></div>;
+  if (currentScreen === 'GAME_INTRO') return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center relative">
+      <ExitButton dark />
+      <div className="text-center text-white">
+        <h2 className="text-4xl font-bold mb-8">Task 1: Reflexes</h2>
+        <div className="space-y-2 mb-8 text-slate-300">
+          <p>Tap screen immediately when it turns GREEN.</p>
+          <p>Do NOT tap on RED.</p>
+        </div>
+        <button onClick={startPVT} className="bg-emerald-500 hover:bg-emerald-600 text-white py-5 px-12 rounded-2xl font-bold text-xl shadow-lg transition-all transform hover:-translate-y-1">
+          BEGIN TASK
+        </button>
+      </div>
+    </div>
+  );
+  if (currentScreen === 'GAME') return (
+    <div
+      onMouseDown={handlePVTClick}
+      className={`min-h-screen cursor-pointer flex flex-col items-center justify-center transition-colors duration-100 select-none ${
+        gameState === 'WAITING'
+          ? 'bg-rose-500'
+          : gameState === 'STIMULUS'
+          ? 'bg-emerald-500'
+          : 'bg-slate-900'
+      }`}
+    >
+      <ExitButton dark />
+      {gameState === 'FINISHED' ? (
+        <div className="text-white text-4xl font-bold animate-pulse">Test Complete</div>
+      ) : (
+        <>
+          <div className="text-white/80 font-mono text-4xl font-bold mb-8">
+            {gameState === 'WAITING' ? 'WAIT...' : gameState === 'STIMULUS' ? 'CLICK!' : ''}
+          </div>
+          <div className="absolute bottom-10 flex gap-8 text-white/60 font-mono text-lg">
+            <div>{(gameTimeLeft / 1000).toFixed(1)}s</div>
+            <div>Hits: {reactions.length}</div>
+            <div>Errors: {falseStarts}</div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+  
+  if (currentScreen === 'MEMORY_INTRO') return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center relative">
+      <ExitButton dark />
+      <div className="text-center text-white">
+        <h2 className="text-4xl font-bold mb-8">Task 2: Memory</h2>
+        <div className="space-y-2 mb-8 text-slate-300">
+          <p>Watch the grid squares light up.</p>
+          <p>Repeat the sequence exactly.</p>
+        </div>
+        <button onClick={startMemoryGame} className="bg-blue-500 hover:bg-blue-600 text-white py-5 px-12 rounded-2xl font-bold text-xl shadow-lg transition-all transform hover:-translate-y-1">
+          BEGIN TASK
+        </button>
+      </div>
+    </div>
+  );
+  if (currentScreen === 'MEMORY') return (
+    <div className="min-h-screen bg-slate-800 flex flex-col items-center justify-center p-4 relative">
+      <ExitButton dark />
+      <h2 className="text-white text-2xl font-bold mb-8">
+        {memoryState === 'SHOWING' ? 'Watch Sequence...' :
+         memoryState === 'USER_TURN' ? 'Your Turn' :
+         memoryState === 'SUCCESS' ? 'Correct!' : 'Incorrect'}
+      </h2>
+      <div className="grid grid-cols-3 gap-4 mb-8">
+        {Array.from({ length: 9 }).map((_: any, i: number) => (
+          <div
+            key={i}
+            onMouseDown={() => handleMemoryClick(i)}
+            className={`w-24 h-24 rounded-xl transition-all duration-200 border-4 ${
+              showingIdx === i
+                ? 'bg-blue-400 border-blue-200 shadow-[0_0_20px_rgba(96,165,250,0.5)] transform scale-105'
+                : 'bg-slate-700 border-slate-600 hover:border-slate-500'
+            } ${memoryState === 'USER_TURN' ? 'cursor-pointer active:bg-blue-500' : 'cursor-default'}`}
+          />
+        ))}
+      </div>
+      <div className="text-slate-400 font-mono text-lg">Level: {memoryLevel - 2}</div>
+    </div>
+  );
+  
+  if (currentScreen === 'QA_INTRO') return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center relative">
+      <ExitButton />
+      <div className="max-w-md w-full text-center space-y-6">
+        <Activity className="w-16 h-16 mx-auto text-purple-600" />
+        <h2 className="text-3xl font-bold text-slate-800">Response Based Test</h2>
+        <p className="text-slate-600">Final section: Clinical questions regarding daily behavior.</p>
+        <button onClick={startQA} className="w-full bg-purple-600 hover:bg-purple-700 text-white py-4 rounded-xl font-bold text-xl transition-all shadow-lg">
+          Start Questionnaire
+        </button>
+      </div>
+    </div>
+  );
+  
+  if (currentScreen === 'QA_LOADING') return (
+    <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center relative">
+      <ExitButton />
+      <div className="max-w-md w-full text-center space-y-8 p-8">
+        <div className="relative w-24 h-24 mx-auto">
+          <div className="absolute inset-0 border-4 border-slate-100 rounded-full"></div>
+          <div className="absolute inset-0 border-4 border-purple-600 rounded-full border-t-transparent animate-spin"></div>
+          <Brain className="absolute inset-0 m-auto text-purple-600 w-10 h-10" />
+        </div>
+        <div>
+          <h3 className="text-xl font-bold text-slate-800 mb-2">Analyzing History...</h3>
+          <p className="text-slate-500">The Neural Engine is generating a dynamic question set based on previous performance patterns.</p>
+        </div>
+        <div className="flex justify-center gap-2">
+          <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '0s' }}></span>
+          <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></span>
+          <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
+        </div>
+      </div>
+    </div>
+  );
+  
+  if (currentScreen === 'QA') return (
+    <div className="min-h-screen bg-slate-50 flex flex-col relative">
+      <ExitButton />
+      <div className="max-w-3xl mx-auto w-full p-6 space-y-6 mt-10 pb-20">
+        {activeQuestions.map((q: QAQuestion, idx: number) => (
+          <div key={q.id} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="font-bold text-lg text-slate-800 flex gap-3">
+                <span className="bg-purple-100 text-purple-600 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold">
+                  {idx + 1}
+                </span>
+                {q.text}
+              </h3>
+              <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider border border-slate-100 px-2 py-1 rounded-lg">
+                {q.category}
+              </span>
+            </div>
+            <div className="grid gap-2 pl-11">
+              {q.options.map((o: string, i: number) => (
+                <button
+                  key={i}
+                  onClick={() => handleAnswer(q.id, i)}
+                  className={`w-full text-left p-4 rounded-xl border-2 transition-all ${
+                    answers[q.id] === i
+                      ? 'bg-purple-50 border-purple-500 text-purple-900 font-medium'
+                      : 'bg-white border-slate-100 hover:border-slate-300 text-slate-600'
+                  }`}
+                >
+                  {o}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        <button
+          onClick={submitQA}
+          disabled={Object.keys(answers).length !== activeQuestions.length}
+          className="w-full bg-slate-900 text-white py-5 rounded-2xl font-bold text-xl hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition shadow-xl"
+        >
+          Generate Clinical Report
+        </button>
+      </div>
+    </div>
+  );
 
   // --- RESULTS SCREEN ---
   if (currentScreen === 'RESULTS') {
@@ -646,37 +1061,31 @@ export default function AssessmentPlatform() {
 
           <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-xl flex items-center gap-3 text-emerald-800">
              <Database className="w-5 h-5" />
-             <span className="font-bold">Assessment record saved to clinical database.</span>
+             <span className="font-bold">Assessment record saved to on-device database.</span>
           </div>
 
           <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
             <ResultCard 
-               title="Speed & Attention" 
+               title="Attention & Speed" 
                icon={<Zap className="text-amber-500"/>} 
                color="amber" 
                score={results.models.api}
-               inactive={!results.status.pvtValid} 
+               inactive={!results.status.pvtValid} // Visual fade if invalid
             >
-               <MetricRow label="Response Speed" value={results.status.pvtValid ? `${(1000/results.raw.meanRT).toFixed(1)} /s` : 'N/A'} />
-               <MetricRow label="Instability (CoV)" value={results.status.pvtValid ? `${results.raw.cov.toFixed(1)}%` : 'N/A'} warning={results.raw.cov > 20} />
-               <MetricRow label="Lapses (>500ms)" value={results.status.pvtValid ? results.raw.lapses : 'N/A'} warning={results.raw.lapses > 2} />
-               <div className="mt-2 text-xs text-slate-400 border-t border-slate-50 pt-2">
-                 False Starts: <span className="font-mono text-slate-600">{falseStarts}</span>
-               </div>
+               <MetricRow label="Reaction Latency" value={results.status.pvtValid ? `${results.raw.meanRT.toFixed(0)} ms` : 'N/A'} />
+               <MetricRow label="Consistency (SD)" value={results.status.pvtValid ? `±${results.raw.sdRT.toFixed(0)} ms` : 'N/A'} warning={results.raw.sdRT > 150} />
+               <MetricRow label="Mental Fatigue" value={results.status.pvtValid ? `${results.raw.fatigueIndex > 0 ? '+' : ''}${results.raw.fatigueIndex.toFixed(0)}` : 'N/A'} warning={results.raw.fatigueIndex > 50} />
             </ResultCard>
 
             <ResultCard 
-               title="Working Memory" 
+               title="Memory & Processing" 
                icon={<Brain className="text-blue-500"/>} 
                color="blue" 
                score={results.models.wmc}
                inactive={!results.status.memValid}
             >
-               <MetricRow label="Max Span" value={results.status.memValid ? results.raw.maxSpan : 'N/A'} />
-               <MetricRow label="Throughput" value={results.status.memValid ? `${results.raw.throughput.toFixed(1)}` : 'N/A'} warning={results.raw.throughput < 1.0}/>
-               <div className="mt-2 text-xs text-slate-400 border-t border-slate-50 pt-2">
-                 Avg Latency: <span className="font-mono text-slate-600">{results.raw.avgRecallLatency.toFixed(0)}ms</span>
-               </div>
+               <MetricRow label="Working Span" value={results.status.memValid ? results.raw.maxSpan : 'N/A'} />
+               <MetricRow label="Retrieval Speed" value={results.status.memValid ? `${results.raw.avgRecallLatency.toFixed(0)} ms` : 'N/A'} />
             </ResultCard>
 
             <ResultCard 
@@ -730,7 +1139,7 @@ export default function AssessmentPlatform() {
             </div>
             <div className="md:col-span-7 bg-white rounded-3xl shadow-sm border border-slate-100 flex flex-col overflow-hidden">
               <div className="p-6 border-b border-slate-50 bg-slate-50/30"><h3 className="font-bold text-slate-800">History Log</h3></div>
-              <div className="overflow-y-auto p-4 space-y-4 flex-grow">{listData.length === 0 ? (<p className="text-center text-slate-400 py-10">No assessments recorded.</p>) : (listData.map((record) => (<div key={record.id} className="p-5 rounded-2xl bg-white border border-slate-100 hover:border-indigo-100 hover:shadow-md transition-all group"><div className="flex justify-between items-start mb-3"><div><div className="flex items-center gap-2 text-slate-500 mb-1"><Calendar className="w-3 h-3" /><span className="text-xs font-bold uppercase tracking-wider">{new Date(record.date).toLocaleDateString()}</span><span className="text-xs opacity-50">{new Date(record.date).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div>{record.insight_text && <p className="text-xs text-slate-600 italic mt-1 max-w-md line-clamp-1">"{record.insight_text}"</p>}</div><span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide ${record.risk_level?.includes('Low') ? 'bg-emerald-100 text-emerald-700' : record.risk_level?.includes('Moderate') ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'}`}>{record.risk_level || 'N/A'}</span></div><div className="grid grid-cols-4 gap-4 mt-4 pt-4 border-t border-slate-50"><div><div className="text-[10px] text-slate-400 font-bold uppercase">GCS</div><div className={`text-xl font-black ${getScoreColor(record.gcs)}`}>{record.gcs?.toFixed(0)}</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">Speed</div><div className="text-sm font-semibold text-slate-600">{record.rt_mean ? (1000/record.rt_mean).toFixed(1) : '-'} /s</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">CoV</div><div className="text-sm font-semibold text-slate-600">{record.cov ? record.cov.toFixed(1) : '-'}%</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">Throughput</div><div className={`text-sm font-semibold text-slate-600`}>{record.throughput ? record.throughput.toFixed(1) : '-'}</div></div></div></div>)))}</div>
+              <div className="overflow-y-auto p-4 space-y-4 flex-grow">{listData.length === 0 ? (<p className="text-center text-slate-400 py-10">No assessments recorded.</p>) : (listData.map((record) => (<div key={record.id} className="p-5 rounded-2xl bg-white border border-slate-100 hover:border-indigo-100 hover:shadow-md transition-all group"><div className="flex justify-between items-start mb-3"><div><div className="flex items-center gap-2 text-slate-500 mb-1"><Calendar className="w-3 h-3" /><span className="text-xs font-bold uppercase tracking-wider">{new Date(record.date).toLocaleDateString()}</span><span className="text-xs opacity-50">{new Date(record.date).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div>{record.insight_text && <p className="text-xs text-slate-600 italic mt-1 max-w-md line-clamp-1">"{record.insight_text}"</p>}</div><span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide ${record.risk_level?.includes('Low') ? 'bg-emerald-100 text-emerald-700' : record.risk_level?.includes('Moderate') ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'}`}>{record.risk_level || 'N/A'}</span></div><div className="grid grid-cols-4 gap-4 mt-4 pt-4 border-t border-slate-50"><div><div className="text-[10px] text-slate-400 font-bold uppercase">GCS</div><div className={`text-xl font-black ${getScoreColor(record.gcs)}`}>{record.gcs?.toFixed(0)}</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">Response</div><div className="text-sm font-semibold text-slate-600">{record.rt_mean ? record.rt_mean.toFixed(0) : '-'}ms</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">Stability</div><div className="text-sm font-semibold text-slate-600">±{record.rt_sd ? record.rt_sd.toFixed(0) : '-'}</div></div><div><div className="text-[10px] text-slate-400 font-bold uppercase">Fatigue</div><div className={`text-sm font-semibold ${record.fatigue > 30 ? 'text-amber-600' : 'text-slate-600'}`}>{record.fatigue ? record.fatigue.toFixed(0) : '-'}</div></div></div></div>)))}</div>
             </div>
           </div>
         </div>
@@ -738,7 +1147,45 @@ export default function AssessmentPlatform() {
     );
   }
 
-  return null;
+  // --- SNACKBAR NOTIFICATION CONTAINER ---
+  return (
+    <>
+      {/* Snackbar container - fixed position at bottom right */}
+      <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50 pointer-events-none">
+        {snackbars.map((notification) => {
+          const bgColorMap = {
+            success: 'bg-emerald-600',
+            error: 'bg-rose-600',
+            warning: 'bg-amber-600',
+            info: 'bg-blue-600',
+          };
+          
+          const iconMap = {
+            success: <CheckCircle className="w-5 h-5" />,
+            error: <XCircle className="w-5 h-5" />,
+            warning: <AlertTriangle className="w-5 h-5" />,
+            info: <Info className="w-5 h-5" />,
+          };
+
+          return (
+            <div
+              key={notification.id}
+              className={`${bgColorMap[notification.type]} text-white px-5 py-3 rounded-lg shadow-lg flex items-center gap-3 pointer-events-auto animate-in slide-in-from-right-4 fade-in duration-300`}
+            >
+              {iconMap[notification.type]}
+              <span className="text-sm font-medium flex-1">{notification.message}</span>
+              <button
+                onClick={() => closeSnackbar(notification.id)}
+                className="ml-2 hover:opacity-80 transition flex-shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
 }
 
 // --- SUB COMPONENTS ---
